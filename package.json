@@ -1,0 +1,14 @@
+{
+  "name": "persona-visual-worker",
+  "version": "1.0.0",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.43.0",
+    "node-fetch": "^3.3.2",
+    "openai": "4.1.0"
+  }
+}
