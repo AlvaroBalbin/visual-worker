@@ -26,12 +26,13 @@ function execPromise(cmd) {
 }
 
 async function processVisualJob() {
-  console.log('Checking for pending visual_jobs...')
+  console.log('Checking for pending/failed visual_jobs...')
 
+  // 🔥 IMPORTANT CHANGE: pick up BOTH pending + failed
   const { data: jobs, error } = await supabase
     .from('visual_jobs')
     .select('id, simulation_id, status')
-    .eq('status', 'pending')
+    .in('status', ['pending', 'failed'])
     .limit(1)
 
   if (error) {
@@ -40,12 +41,12 @@ async function processVisualJob() {
   }
 
   if (!jobs || jobs.length === 0) {
-    console.log('No pending jobs.')
+    console.log('No pending/failed jobs.')
     return
   }
 
   const job = jobs[0]
-  console.log('Processing job:', job.id, 'for simulation:', job.simulation_id)
+  console.log(`Processing job ${job.id} (status=${job.status}) for simulation ${job.simulation_id}`)
 
   // mark as processing
   await supabase
