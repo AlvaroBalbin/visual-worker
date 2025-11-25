@@ -74,25 +74,53 @@ async function processVisualJob() {
   }
 
   const visualPrompt = `
-Frames:
+You are analyzing short-form social video frames.
+
+Here are the frame image URLs:
 ${frameUrls.join('\n')}
 
-Transcript:
+Transcript (may be empty):
 ${sim.transcript || ''}
 
-Return ONLY JSON with this schema:
+Return ONLY valid JSON following this schema exactly:
+
 {
-  "visual_style": "string",
-  "pacing_description": "string",
-  "on_screen_text_usage": "string",
-  "aesthetic_tags": ["string"],
-  "scene_summary": "string",
+  "visual_style": "overall aesthetic and editing style",
+  "pacing_description": "how fast cuts occur, motion level, energy",
+  "on_screen_text_usage": "describe captions or text overlays",
+  "aesthetic_tags": ["short tags describing aesthetic vibe"],
+  
+  "environment_analysis": {
+    "environment_type": "indoor | outdoor | studio | room | nature | urban | unknown",
+    "environment_description": "detailed description of location and scenery",
+    "foreground_objects": ["object1", "object2"],
+    "background_elements": ["element1", "element2"]
+  },
+
+  "motion_analysis": {
+    "is_static": true,
+    "camera_movement": "none | panning | handheld | zoom | shaky",
+    "subject_movement": "none | low | medium | high"
+  },
+
+  "scene_summary": "holistic summary of what visually happens in the video",
+
+  "video_type_inference": "guess the type of video: vlog, b-roll, meme, tutorial, aesthetic edit, storytime, promo, educational, etc.",
+
   "quality_assessment": {
     "resolution_ok": true,
     "lighting_ok": "good | okay | poor",
     "edit_quality": "simple | basic | advanced | chaotic"
   }
 }
+
+Rules:
+- You MUST output valid JSON only.
+- Use BOTH the frames and transcript to infer context.
+- If frames are static, explicitly state that the video is static.
+- If outdoor scenery is visible, describe it accurately.
+`.trim()
+
 `
 
   const completion = await openai.chat.completions.create({
