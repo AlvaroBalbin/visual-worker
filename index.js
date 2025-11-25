@@ -4,12 +4,17 @@ import fs from 'fs'
 import fetch from 'node-fetch'
 import OpenAI from 'openai'
 
-const supabase = createClient(
-  process.env.SUPABASE_URL,
-  process.env.SUPABASE_SERVICE_ROLE_KEY
-)
+const supabaseUrl = process.env.SUPABASE_URL
+const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY
+const openaiKey = process.env.OPENAI_API_KEY
 
-const openai = new OpenAI({ apiKey: process.env.OPENAI_API_KEY })
+if (!supabaseUrl || !supabaseServiceKey || !openaiKey) {
+  console.error('Missing env vars SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY / OPENAI_API_KEY')
+  process.exit(1)
+}
+
+const supabase = createClient(supabaseUrl, supabaseServiceKey)
+const openai = new OpenAI({ apiKey: openaiKey })
 
 function execPromise(cmd) {
   return new Promise((resolve, reject) => {
@@ -21,104 +26,150 @@ function execPromise(cmd) {
 }
 
 async function processVisualJob() {
+  console.log('Checking for pending visual_jobs...')
+
   const { data: jobs, error } = await supabase
     .from('visual_jobs')
-    .select('id, simulation_id')
+    .select('id, simulation_id, status')
     .eq('status', 'pending')
     .limit(1)
 
-  if (error || !jobs || jobs.length === 0) return
+  if (error) {
+    console.error('visual_jobs select error:', error)
+    return
+  }
+
+  if (!jobs || jobs.length === 0) {
+    console.log('No pending jobs.')
+    return
+  }
 
   const job = jobs[0]
+  console.log('Processing job:', job.id, 'for simulation:', job.simulation_id)
 
+  // mark as processing
   await supabase
     .from('visual_jobs')
-    .update({ status: 'processing' })
+    .update({ status: 'processing', error_message: null })
     .eq('id', job.id)
 
-  const { data: sim } = await supabase
-    .from('simulations')
-    .select('video_url, transcript')
-    .eq('id', job.simulation_id)
-    .single()
+  try {
+    const { data: sim, error: simErr } = await supabase
+      .from('simulations')
+      .select('video_url, transcript')
+      .eq('id', job.simulation_id)
+      .single()
 
-  if (!sim?.video_url) throw new Error('No video_url on simulation')
+    if (simErr) throw simErr
+    if (!sim?.video_url) throw new Error('No video_url on simulation')
 
-  const videoRes = await fetch(sim.video_url)
-  const arrayBuf = await videoRes.arrayBuffer()
-  const videoPath = `/tmp/${job.id}.mp4`
-  fs.writeFileSync(videoPath, Buffer.from(arrayBuf))
+    console.log('Downloading video:', sim.video_url)
 
-  const framesDir = `/tmp/frames-${job.id}`
-  fs.mkdirSync(framesDir, { recursive: true })
+    const videoRes = await fetch(sim.video_url)
+    if (!videoRes.ok) {
+      throw new Error(`Failed to fetch video: ${videoRes.status} ${videoRes.statusText}`)
+    }
 
-  await execPromise(`ffmpeg -i ${videoPath} -vf "fps=1" ${framesDir}/frame-%02d.jpg`)
+    const arrayBuf = await videoRes.arrayBuffer()
+    const videoPath = `/tmp/${job.id}.mp4`
+    fs.writeFileSync(videoPath, Buffer.from(arrayBuf))
 
-  const frameFiles = fs.readdirSync(framesDir).filter(f => f.endsWith('.jpg'))
-  const frameUrls = []
+    const framesDir = `/tmp/frames-${job.id}`
+    fs.mkdirSync(framesDir, { recursive: true })
 
-  for (const file of frameFiles) {
-    const full = `${framesDir}/${file}`
-    const buf = fs.readFileSync(full)
-    const uploadPath = `${job.simulation_id}/${job.id}/${file}`
+    console.log('Extracting frames with ffmpeg...')
+    await execPromise(`ffmpeg -i ${videoPath} -vf "fps=1" ${framesDir}/frame-%02d.jpg`)
 
-    await supabase.storage
-      .from('video-frames')
-      .upload(uploadPath, buf, { contentType: 'image/jpeg', upsert: true })
+    const frameFiles = fs.readdirSync(framesDir).filter((f) => f.endsWith('.jpg'))
+    const frameUrls = []
 
-    const { data } = supabase.storage
-      .from('video-frames')
-      .getPublicUrl(uploadPath)
+    console.log('Uploading', frameFiles.length, 'frames to storage...')
 
-    frameUrls.push(data.publicUrl)
-  }
+    for (const file of frameFiles) {
+      const full = `${framesDir}/${file}`
+      const buf = fs.readFileSync(full)
+      const uploadPath = `${job.simulation_id}/${job.id}/${file}`
 
-  const visualPrompt = `
-Frames:
-${frameUrls.join('\n')}
+      const { error: uploadErr } = await supabase.storage
+        .from('video-frames')
+        .upload(uploadPath, buf, { contentType: 'image/jpeg', upsert: true })
 
-Transcript:
-${sim.transcript || ''}
+      if (uploadErr) throw uploadErr
 
-Return ONLY JSON with this schema:
-{
-  "visual_style": "string",
-  "pacing_description": "string",
-  "on_screen_text_usage": "string",
-  "aesthetic_tags": ["string"],
-  "scene_summary": "string",
-  "quality_assessment": {
-    "resolution_ok": true,
-    "lighting_ok": "good | okay | poor",
-    "edit_quality": "simple | basic | advanced | chaotic"
-  }
-}
-`
+      const { data } = supabase.storage
+        .from('video-frames')
+        .getPublicUrl(uploadPath)
 
-  const completion = await openai.chat.completions.create({
-    model: 'gpt-4.1',
-    response_format: { type: 'json_object' },
-    messages: [
-      { role: 'system', content: 'You analyze short-form video frames visually.' },
-      { role: 'user', content: visualPrompt }
-    ]
-  })
+      frameUrls.push(data.publicUrl)
+    }
 
-  const visualAnalysis = JSON.parse(completion.choices[0].message.content)
+    const visualPrompt = [
+      'Frames:',
+      frameUrls.join('\n'),
+      '',
+      'Transcript:',
+      sim.transcript || '',
+      '',
+      'Return ONLY JSON with this schema:',
+      '{',
+      '  "visual_style": "string",',
+      '  "pacing_description": "string",',
+      '  "on_screen_text_usage": "string",',
+      '  "aesthetic_tags": ["string"],',
+      '  "scene_summary": "string",',
+      '  "quality_assessment": {',
+      '    "resolution_ok": true,',
+      '    "lighting_ok": "good | okay | poor",',
+      '    "edit_quality": "simple | basic | advanced | chaotic"',
+      '  }',
+      '}'
+    ].join('\n')
 
-  await supabase
-    .from('visual_jobs')
-    .update({
-      status: 'complete',
-      frames: frameUrls,
-      visual_analysis: visualAnalysis
+    console.log('Calling OpenAI for visual analysis...')
+
+    const completion = await openai.chat.completions.create({
+      model: 'gpt-4.1',
+      response_format: { type: 'json_object' },
+      messages: [
+        { role: 'system', content: 'You analyze short-form video frames visually.' },
+        { role: 'user', content: visualPrompt }
+      ]
     })
-    .eq('id', job.id)
 
-  await supabase
-    .from('simulations')
-    .update({ visual_analysis: visualAnalysis })
-    .eq('id', job.simulation_id)
+    const content = completion.choices[0].message.content
+    if (!content) throw new Error('Empty visual analysis response')
+
+    const visualAnalysis = JSON.parse(content)
+
+    console.log('Saving visual analysis to Supabase...')
+
+    await supabase
+      .from('visual_jobs')
+      .update({
+        status: 'complete',
+        frames: frameUrls,
+        visual_analysis: visualAnalysis,
+        error_message: null
+      })
+      .eq('id', job.id)
+
+    await supabase
+      .from('simulations')
+      .update({ visual_analysis: visualAnalysis })
+      .eq('id', job.simulation_id)
+
+    console.log('Job completed:', job.id)
+  } catch (err) {
+    console.error('processVisualJob error:', err)
+
+    await supabase
+      .from('visual_jobs')
+      .update({
+        status: 'failed',
+        error_message: String(err)
+      })
+      .eq('id', job.id)
+  }
 }
 
 async function mainLoop() {
@@ -127,9 +178,9 @@ async function mainLoop() {
     try {
       await processVisualJob()
     } catch (err) {
-      console.error('Worker error:', err)
+      console.error('Worker error (outer):', err)
     }
-    await new Promise(r => setTimeout(r, 3000))
+    await new Promise((r) => setTimeout(r, 3000))
   }
 }
 
