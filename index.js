@@ -167,11 +167,9 @@ async function processVisualJob() {
         // Otherwise, fall back to FPS-based timing.
         let tsSeconds;
         if (videoDurationSeconds && videoDurationSeconds > 0 && frameCount > 0) {
-          // Place frames evenly across the duration, offset a bit from edges
           const position = (i + 1) / (frameCount + 1); // 0..1
           tsSeconds = position * videoDurationSeconds;
         } else {
-          // Fallback: use FPS (center of that frame's “slot”)
           tsSeconds = (i + 0.5) / DEFAULT_FPS;
         }
 
@@ -183,15 +181,29 @@ async function processVisualJob() {
       }
     }
 
-    // --- OpenAI visual analysis (coarse) ------------------------------------
+    // --- OpenAI visual analysis (coarse + visual events) ---------------------
+
+    const framesListing = frameTimeline
+      .map(
+        (f) =>
+          `[${f.index}] t=${f.timestamp_seconds.toFixed(
+            2
+          )}s → ${f.url}`
+      )
+      .join('\n');
 
     const visualPrompt = [
       'You are a short-form video creative strategist.',
       'You will receive:',
       '- A sequence of frame image URLs extracted evenly from a short-form video.',
-      '- The full transcript of the video.',
+      '- Each frame has an index and an approximate timestamp in seconds from the start.',
+      '- The full transcript of the video (optional).',
       '',
-      'Use these to infer what the video LOOKS like and how it FEELS to watch.',
+      'Your tasks:',
+      '1) Describe what the video looks like and how it feels to watch.',
+      '2) Group the frames into 3–8 key visual beats / events (scenes, important moments).',
+      '3) For each event, reference frame indices ONLY (the backend will map indices to exact times).',
+      '',
       'Return ONLY valid JSON with this exact schema:',
       '',
       '{',
@@ -204,17 +216,35 @@ async function processVisualJob() {
       '    "lighting_ok": "good | okay | poor",',
       '    "edit_quality": "simple | basic | advanced | chaotic"',
       '  },',
-      '  "on_screen_text_usage": "string describing lower-thirds, captions, UI text, etc."',
+      '  "on_screen_text_usage": "string describing lower-thirds, captions, UI text, etc.",',
+      '',
+      '  "visual_events": [',
+      '    {',
+      '      "label": "short description of a visual beat or scene",',
+      '      "start_frame_index": 0,            // integer index into the frames list below',
+      '      "end_frame_index": 5,             // inclusive, integer index (>= start_frame_index)',
+      '      "notes_for_editor": [             // 1–3 bullets with visual/editing notes',
+      '        "string",',
+      '        "string"',
+      '      ]',
+      '    }',
+      '  ]',
       '}',
       '',
-      'Frames:',
-      frameUrls.join('\n'),
+      'Rules for visual_events:',
+      '- Use ONLY integer frame indices that exist in the frames list.',
+      '- start_frame_index must be >= 0 and < number_of_frames.',
+      '- end_frame_index must be >= start_frame_index and < number_of_frames.',
+      '- Prefer 3–8 events total.',
       '',
-      'Transcript:',
+      'Frames (index, timestamp, URL):',
+      framesListing,
+      '',
+      'Transcript (optional, for context):',
       sim.transcript || '(no transcript available)',
     ].join('\n');
 
-    console.log('Calling OpenAI for base visual analysis…');
+    console.log('Calling OpenAI for base visual analysis + visual events…');
 
     const completion = await openai.chat.completions.create({
       model: 'gpt-4.1',
@@ -223,7 +253,7 @@ async function processVisualJob() {
         {
           role: 'system',
           content:
-            'You are a visual strategist for TikTok/Reels shorts. Focus ONLY on describing visuals and perceived pacing, and always return strict JSON.',
+            'You are a visual strategist for TikTok/Reels shorts. Focus on visuals and perceived pacing, group frames into key visual events, and always return strict JSON.',
         },
         { role: 'user', content: visualPrompt },
       ],
@@ -234,9 +264,71 @@ async function processVisualJob() {
 
     const visualAnalysis = JSON.parse(content);
 
-    // Attach frame_timeline so downstream functions know
-    // which frame roughly corresponds to which time in the video.
+    // --- Post-process visual_events: convert frame indices → seconds ---------
+
+    const rawEvents = Array.isArray(visualAnalysis.visual_events)
+      ? visualAnalysis.visual_events
+      : [];
+
+    const eventsWithTimes = rawEvents
+      .map((ev) => {
+        if (!ev) return null;
+
+        const label =
+          typeof ev.label === 'string' ? ev.label.trim() : '';
+
+        if (!label) return null;
+
+        const startIdxRaw =
+          typeof ev.start_frame_index === 'number'
+            ? ev.start_frame_index
+            : 0;
+        const endIdxRaw =
+          typeof ev.end_frame_index === 'number'
+            ? ev.end_frame_index
+            : startIdxRaw;
+
+        const maxIndex = frameTimeline.length - 1;
+        const startIdx = Math.max(
+          0,
+          Math.min(startIdxRaw | 0, maxIndex)
+        );
+        const endIdx = Math.max(
+          startIdx,
+          Math.min(endIdxRaw | 0, maxIndex)
+        );
+
+        const startFrame = frameTimeline[startIdx];
+        const endFrame = frameTimeline[endIdx];
+
+        const startSeconds = startFrame
+          ? startFrame.timestamp_seconds
+          : 0;
+        const endSeconds = endFrame
+          ? endFrame.timestamp_seconds
+          : startSeconds;
+
+        const notes =
+          Array.isArray(ev.notes_for_editor) &&
+          ev.notes_for_editor.length
+            ? ev.notes_for_editor.map((n) =>
+                typeof n === 'string' ? n.trim() : ''
+              ).filter(Boolean)
+            : [];
+
+        return {
+          label,
+          start_frame_index: startIdx,
+          end_frame_index: endIdx,
+          start_seconds: Number(startSeconds.toFixed(2)),
+          end_seconds: Number(endSeconds.toFixed(2)),
+          notes_for_editor: notes,
+        };
+      })
+      .filter(Boolean);
+
     visualAnalysis.frame_timeline = frameTimeline;
+    visualAnalysis.visual_events = eventsWithTimes;
 
     // --- Save back to Supabase ---------------------------------------------
 
