@@ -247,7 +247,7 @@ async function processVisualJob() {
     console.log('Calling OpenAI for base visual analysis + visual events…');
 
     const completion = await openai.chat.completions.create({
-      model: 'gpt-4.1',
+      model: 'gpt-5.1',
       response_format: { type: 'json_object' },
       messages: [
         {
