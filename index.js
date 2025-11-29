@@ -13,6 +13,10 @@ const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
 const openaiKey = process.env.OPENAI_API_KEY;
 
+// Tuning knobs for frames
+const DEFAULT_FPS = parseFloat(process.env.VISUAL_FRAMES_FPS || '2'); // was 1
+const MAX_FRAMES = parseInt(process.env.VISUAL_MAX_FRAMES || '120', 10); // cap uploads
+
 if (!supabaseUrl || !supabaseServiceKey || !openaiKey) {
   console.error(
     'Missing env vars SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY / OPENAI_API_KEY'
@@ -98,13 +102,30 @@ async function processVisualJob() {
     const framesDir = `/tmp/frames-${job.id}`;
     fs.mkdirSync(framesDir, { recursive: true });
 
-    console.log('Extracting frames with ffmpeg…');
-    // 1 frame per second is enough for a visual overview
-    await execPromise(`ffmpeg -i ${videoPath} -vf "fps=1" ${framesDir}/frame-%02d.jpg`);
+    console.log(
+      `Extracting frames with ffmpeg at ~${DEFAULT_FPS} fps for higher visual coverage…`
+    );
 
-    const frameFiles = fs
+    // Higher FPS for better coverage; you can adjust via VISUAL_FRAMES_FPS env var
+    await execPromise(
+      `ffmpeg -y -i ${videoPath} -vf "fps=${DEFAULT_FPS}" ${framesDir}/frame-%05d.jpg`
+    );
+
+    let frameFiles = fs
       .readdirSync(framesDir)
-      .filter((f) => f.toLowerCase().endsWith('.jpg'));
+      .filter((f) => f.toLowerCase().endsWith('.jpg'))
+      .sort(); // ensure chronological order
+
+    console.log('Extracted', frameFiles.length, 'raw frames');
+
+    // Downsample if we have too many frames (keep evenly-spaced subset)
+    if (frameFiles.length > MAX_FRAMES) {
+      const step = Math.ceil(frameFiles.length / MAX_FRAMES);
+      frameFiles = frameFiles.filter((_, idx) => idx % step === 0);
+      console.log(
+        `Downsampled frames to ${frameFiles.length} (MAX_FRAMES=${MAX_FRAMES}, step=${step})`
+      );
+    }
 
     const frameUrls = [];
     console.log('Uploading', frameFiles.length, 'frames to storage…');
@@ -140,10 +161,11 @@ async function processVisualJob() {
     const visualPrompt = [
       'You are a short-form video creative strategist.',
       'You will receive:',
-      '- A set of frame image URLs extracted from a short-form video',
-      '- The full transcript of the video',
+      '- A sequence of frame image URLs extracted evenly from a short-form video (roughly 0.5s–1s apart).',
+      '- The full transcript of the video.',
       '',
-      'You must visually and narratively analyze the content and return ONLY valid JSON with this exact schema:',
+      'Use these to infer what the video LOOKS like and how it FEELS to watch.',
+      'Return ONLY valid JSON with this exact schema:',
       '',
       '{',
       '  "visual_style": "string (1–2 sentences about the overall look & vibe)",',
@@ -155,40 +177,8 @@ async function processVisualJob() {
       '    "lighting_ok": "good | okay | poor",',
       '    "edit_quality": "simple | basic | advanced | chaotic"',
       '  },',
-      '  "on_screen_text_usage": "string describing lower-thirds, captions, UI text, etc.",',
-      '',
-      '  "storytelling_insights": {',
-      '    "what_worked": [',
-      '      "bullet about strong storytelling element",',
-      '      "another bullet about what was effective"',
-      '    ],',
-      '    "what_to_improve": [',
-      '      "bullet about a confusing / weak storytelling choice",',
-      '      "another bullet about hook, stakes, clarity, etc."',
-      '    ],',
-      '    "key_changes": [',
-      '      "very concrete, tactical change that would improve narrative clarity or hook",',
-      '      "another concrete, tactical storytelling change"',
-      '    ]',
-      '  },',
-      '',
-      '  "editing_style_insights": {',
-      '    "what_worked": [',
-      '      "bullet about pacing, transitions, cuts, overlays, visual rhythm that worked",',
-      '      "another bullet that is useful for an editor"',
-      '    ],',
-      '    "what_to_improve": [',
-      '      "bullet about pacing issues, dead air, janky cuts, lack of B-roll, etc.",',
-      '      "another bullet that an editor can act on"',
-      '    ],',
-      '    "key_changes": [',
-      '      "very concrete editing tweak (e.g. \\"cut this section shorter\\", \\"add B-roll over this line\\")",',
-      '      "another specific change an editor could implement in a single edit pass"',
-      '    ]',
-      '  }',
+      '  "on_screen_text_usage": "string describing lower-thirds, captions, UI text, etc."', //',
       '}',
-      '',
-      'Make sure every array has 3–4 short, punchy bullets that a creator would actually find useful.',
       '',
       'Frames:',
       frameUrls.join('\n'),
@@ -197,7 +187,7 @@ async function processVisualJob() {
       sim.transcript || '(no transcript available)',
     ].join('\n');
 
-    console.log('Calling OpenAI for visual + storytelling/editing analysis…');
+    console.log('Calling OpenAI for base visual analysis…');
 
     const completion = await openai.chat.completions.create({
       model: 'gpt-4.1',
@@ -206,7 +196,7 @@ async function processVisualJob() {
         {
           role: 'system',
           content:
-            'You are a visual + narrative strategist for TikTok/Reels shorts. Always return strict JSON.',
+            'You are a visual strategist for TikTok/Reels shorts. Focus ONLY on describing visuals and perceived pacing, and always return strict JSON.',
         },
         { role: 'user', content: visualPrompt },
       ],
@@ -231,6 +221,8 @@ async function processVisualJob() {
       })
       .eq('id', job.id);
 
+    // Store initial visual_analysis on the simulation;
+    // analyze_simulation will later enrich this with storytelling/editing insights.
     await supabase
       .from('simulations')
       .update({ visual_analysis: visualAnalysis })
