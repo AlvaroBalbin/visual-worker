@@ -76,15 +76,17 @@ async function processVisualJob() {
     .eq('id', job.id);
 
   try {
-    // Load simulation (we need video_url and transcript)
+    // Load simulation (we need video_url, transcript and ideally duration)
     const { data: sim, error: simErr } = await supabase
       .from('simulations')
-      .select('video_url, transcript')
+      .select('video_url, transcript, video_duration_seconds')
       .eq('id', job.simulation_id)
       .single();
 
     if (simErr) throw simErr;
     if (!sim || !sim.video_url) throw new Error('No video_url on simulation');
+
+    const videoDurationSeconds = sim.video_duration_seconds || 0;
 
     console.log('Downloading video:', sim.video_url);
 
@@ -128,9 +130,14 @@ async function processVisualJob() {
     }
 
     const frameUrls = [];
+    const frameTimeline = [];
+
     console.log('Uploading', frameFiles.length, 'frames to storage…');
 
-    for (const file of frameFiles) {
+    const frameCount = frameFiles.length;
+
+    for (let i = 0; i < frameFiles.length; i++) {
+      const file = frameFiles[i];
       const fullPath = `${framesDir}/${file}`;
       const buf = fs.readFileSync(fullPath);
       const uploadPath = `${job.simulation_id}/${job.id}/${file}`;
@@ -152,16 +159,36 @@ async function processVisualJob() {
         .getPublicUrl(uploadPath);
 
       if (publicData?.publicUrl) {
-        frameUrls.push(publicData.publicUrl);
+        const url = publicData.publicUrl;
+        frameUrls.push(url);
+
+        // Compute an approximate timestamp for this frame.
+        // If we know the video duration, spread frames across it.
+        // Otherwise, fall back to FPS-based timing.
+        let tsSeconds;
+        if (videoDurationSeconds && videoDurationSeconds > 0 && frameCount > 0) {
+          // Place frames evenly across the duration, offset a bit from edges
+          const position = (i + 1) / (frameCount + 1); // 0..1
+          tsSeconds = position * videoDurationSeconds;
+        } else {
+          // Fallback: use FPS (center of that frame's “slot”)
+          tsSeconds = (i + 0.5) / DEFAULT_FPS;
+        }
+
+        frameTimeline.push({
+          index: i,
+          url,
+          timestamp_seconds: Number(tsSeconds.toFixed(2)),
+        });
       }
     }
 
-    // --- OpenAI visual + editing/storytelling analysis ----------------------
+    // --- OpenAI visual analysis (coarse) ------------------------------------
 
     const visualPrompt = [
       'You are a short-form video creative strategist.',
       'You will receive:',
-      '- A sequence of frame image URLs extracted evenly from a short-form video (roughly 0.5s–1s apart).',
+      '- A sequence of frame image URLs extracted evenly from a short-form video.',
       '- The full transcript of the video.',
       '',
       'Use these to infer what the video LOOKS like and how it FEELS to watch.',
@@ -177,7 +204,7 @@ async function processVisualJob() {
       '    "lighting_ok": "good | okay | poor",',
       '    "edit_quality": "simple | basic | advanced | chaotic"',
       '  },',
-      '  "on_screen_text_usage": "string describing lower-thirds, captions, UI text, etc."', //',
+      '  "on_screen_text_usage": "string describing lower-thirds, captions, UI text, etc."',
       '}',
       '',
       'Frames:',
@@ -206,6 +233,10 @@ async function processVisualJob() {
     if (!content) throw new Error('Empty visual analysis response');
 
     const visualAnalysis = JSON.parse(content);
+
+    // Attach frame_timeline so downstream functions know
+    // which frame roughly corresponds to which time in the video.
+    visualAnalysis.frame_timeline = frameTimeline;
 
     // --- Save back to Supabase ---------------------------------------------
 
