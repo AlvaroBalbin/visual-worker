@@ -42,6 +42,111 @@ async function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+function clamp01(v, fallback = 0.5) {
+  const n = typeof v === 'number' && Number.isFinite(v) ? v : fallback;
+  if (n < 0) return 0;
+  if (n > 1) return 1;
+  return n;
+}
+
+// --- New: per-frame quality scoring ----------------------------------------
+
+async function scoreFramesWithOpenAI(frameTimeline, transcript) {
+  if (!Array.isArray(frameTimeline) || frameTimeline.length === 0) {
+    return {};
+  }
+
+  // Keep prompt size sane – we already cap frames via MAX_FRAMES
+  const framesListing = frameTimeline
+    .map(
+      (f) =>
+        `[${f.index}] t=${f.timestamp_seconds.toFixed(2)}s → ${f.url}`
+    )
+    .join('\n');
+
+  const prompt = [
+    'You are rating individual frames from a short-form social video (TikTok/Reels/Shorts).',
+    '',
+    'You will receive:',
+    '- A list of frames, each with an index, timestamp in seconds, and image URL.',
+    '- Optionally, the transcript of the video.',
+    '',
+    'Goal:',
+    '- For EACH frame index, estimate how strong that frame is at *keeping* a viewer from swiping away at that moment.',
+    '- Think about hook strength, visual clarity, emotional impact, novelty, and whether the frame clearly communicates value.',
+    '',
+    'Output STRICT JSON with this schema:',
+    '',
+    '{',
+    '  "frame_scores": [',
+    '    { "index": 0, "quality_score": 0.0 },',
+    '    { "index": 1, "quality_score": 0.0 }',
+    '  ]',
+    '}',
+    '',
+    'Rules:',
+    '- quality_score is a float between 0 and 1.',
+    '- 0.0 = extremely weak / boring / confusing frame that likely causes a swipe.',
+    '- 0.5 = average / okay frame.',
+    '- 1.0 = extremely strong, scroll-stopping, very engaging frame.',
+    '- Include an entry for EVERY frame index you see in the list.',
+    '- Use only the fields "index" and "quality_score" for each frame.',
+    '',
+    'Frames (index, timestamp, URL):',
+    framesListing,
+    '',
+    'Transcript (optional, for context):',
+    transcript || '(no transcript available)',
+  ].join('\n');
+
+  console.log('Calling OpenAI for per-frame quality scores…');
+
+  const completion = await openai.chat.completions.create({
+    model: 'gpt-5.1',
+    response_format: { type: 'json_object' },
+    messages: [
+      {
+        role: 'system',
+        content:
+          'You are an expert short-form video strategist. Rate each frame for how well it retains viewers. Return ONLY strict JSON.',
+      },
+      { role: 'user', content: prompt },
+    ],
+  });
+
+  const content = completion.choices?.[0]?.message?.content;
+  if (!content) {
+    console.warn('Empty frame scoring response, falling back to neutral.');
+    return {};
+  }
+
+  let parsed;
+  try {
+    parsed = JSON.parse(content);
+  } catch (err) {
+    console.error('Failed to parse frame scoring JSON:', err, content.slice(0, 400));
+    return {};
+  }
+
+  const scoresArr = Array.isArray(parsed.frame_scores)
+    ? parsed.frame_scores
+    : [];
+
+  const byIndex = {};
+  for (const item of scoresArr) {
+    if (!item) continue;
+    const idx =
+      typeof item.index === 'number' && Number.isInteger(item.index)
+        ? item.index
+        : null;
+    if (idx === null) continue;
+    const q = clamp01(item.quality_score, 0.5);
+    byIndex[idx] = q;
+  }
+
+  return byIndex;
+}
+
 // --- Core worker logic ------------------------------------------------------
 
 async function processVisualJob() {
@@ -177,11 +282,27 @@ async function processVisualJob() {
           index: i,
           url,
           timestamp_seconds: Number(tsSeconds.toFixed(2)),
+          // quality_score will be filled in later by OpenAI
         });
       }
     }
 
-    // --- OpenAI visual analysis (coarse + visual events) ---------------------
+    // --- New: score each frame for engagement quality -----------------------
+
+    const frameScoresByIndex = await scoreFramesWithOpenAI(
+      frameTimeline,
+      sim.transcript || ''
+    );
+
+    for (const frame of frameTimeline) {
+      const q =
+        frameScoresByIndex[frame.index] !== undefined
+          ? frameScoresByIndex[frame.index]
+          : 0.5;
+      frame.quality_score = Number(clamp01(q, 0.5).toFixed(3));
+    }
+
+    // --- OpenAI visual analysis (coarse + visual events) --------------------
 
     const framesListing = frameTimeline
       .map(
@@ -311,9 +432,11 @@ async function processVisualJob() {
         const notes =
           Array.isArray(ev.notes_for_editor) &&
           ev.notes_for_editor.length
-            ? ev.notes_for_editor.map((n) =>
-                typeof n === 'string' ? n.trim() : ''
-              ).filter(Boolean)
+            ? ev.notes_for_editor
+                .map((n) =>
+                  typeof n === 'string' ? n.trim() : ''
+                )
+                .filter(Boolean)
             : [];
 
         return {
@@ -327,6 +450,7 @@ async function processVisualJob() {
       })
       .filter(Boolean);
 
+    // Attach frame_timeline (now with quality_score) and cleaned visual_events
     visualAnalysis.frame_timeline = frameTimeline;
     visualAnalysis.visual_events = eventsWithTimes;
 
