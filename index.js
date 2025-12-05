@@ -16,6 +16,11 @@ const openaiKey = process.env.OPENAI_API_KEY;
 // Tuning knobs for frames
 const DEFAULT_FPS = parseFloat(process.env.VISUAL_FRAMES_FPS || '2'); // was 1
 const MAX_FRAMES = parseInt(process.env.VISUAL_MAX_FRAMES || '120', 10); // cap uploads
+// NEW: how many frames we send to vision for OCR / on-screen text reading
+const MAX_VISION_FRAMES = parseInt(
+  process.env.VISUAL_OCR_MAX_FRAMES || '24',
+  10
+);
 
 if (!supabaseUrl || !supabaseServiceKey || !openaiKey) {
   console.error(
@@ -302,7 +307,7 @@ async function processVisualJob() {
       frame.quality_score = Number(clamp01(q, 0.5).toFixed(3));
     }
 
-    // --- OpenAI visual analysis (coarse + visual events) --------------------
+    // --- OpenAI visual analysis (coarse + visual events + OCR-ish text) -----
 
     const framesListing = frameTimeline
       .map(
@@ -313,10 +318,13 @@ async function processVisualJob() {
       )
       .join('\n');
 
-    const visualPrompt = [
-      'You are a short-form video creative strategist.',
+    // Limit how many images we actually send to the model for vision/OCR
+    const framesForVision = frameTimeline.slice(0, MAX_VISION_FRAMES);
+
+    const visualPromptText = [
+      'You are a short-form video creative strategist with strong visual understanding AND OCR (you can read text on screen).',
       'You will receive:',
-      '- A sequence of frame image URLs extracted evenly from a short-form video.',
+      '- A sequence of frame images extracted evenly from a short-form video.',
       '- Each frame has an index and an approximate timestamp in seconds from the start.',
       '- The full transcript of the video (optional).',
       '',
@@ -324,6 +332,7 @@ async function processVisualJob() {
       '1) Describe what the video looks like and how it feels to watch.',
       '2) Group the frames into 3–8 key visual beats / events (scenes, important moments).',
       '3) For each event, reference frame indices ONLY (the backend will map indices to exact times).',
+      '4) Read and extract any ON-SCREEN TEXT (captions, subtitles, UI text, labels, signs, lower-thirds, etc.).',
       '',
       'Return ONLY valid JSON with this exact schema:',
       '',
@@ -338,6 +347,14 @@ async function processVisualJob() {
       '    "edit_quality": "simple | basic | advanced | chaotic"',
       '  },',
       '  "on_screen_text_usage": "string describing lower-thirds, captions, UI text, etc.",',
+      '',
+      '  "on_screen_text_spans": [',
+      '    {',
+      '      "text": "exact or near-exact on-screen text",',
+      '      "timestamp_seconds": 0.0',
+      '    }',
+      '  ],',
+      '  "on_screen_text_raw": "single concatenated string of all visible on-screen text you can reasonably read",',
       '',
       '  "visual_events": [',
       '    {',
@@ -363,9 +380,36 @@ async function processVisualJob() {
       '',
       'Transcript (optional, for context):',
       sim.transcript || '(no transcript available)',
+      '',
+      'When you fill "on_screen_text_spans":',
+      '- Use the timestamp_seconds that best matches when that text is clearly visible.',
+      '- You may approximate using the frame timestamps provided (e.g. if a caption appears in Frame 3 at t=1.2s, use ~1.2).',
+      '- Include both big captions and smaller but important overlay text (UI labels, buttons, big headlines, etc.).',
+      '',
+      'Output ONLY STRICT JSON with the fields above. No comments, no extra keys.',
     ].join('\n');
 
-    console.log('Calling OpenAI for base visual analysis + visual events…');
+    // Build multi-modal content: text + images.
+    const userContent = [
+      { type: 'text', text: visualPromptText },
+      // For each chosen frame, provide a short text anchor + the image itself
+      ...framesForVision.flatMap((f) => [
+        {
+          type: 'text',
+          text: `Frame ${f.index} at t=${f.timestamp_seconds.toFixed(
+            2
+          )}s`,
+        },
+        {
+          type: 'image_url',
+          image_url: {
+            url: f.url,
+          },
+        },
+      ]),
+    ];
+
+    console.log('Calling OpenAI for base visual analysis + visual events + OCR…');
 
     const completion = await openai.chat.completions.create({
       model: 'gpt-5.1',
@@ -374,9 +418,13 @@ async function processVisualJob() {
         {
           role: 'system',
           content:
-            'You are a visual strategist for TikTok/Reels shorts. Focus on visuals and perceived pacing, group frames into key visual events, and always return strict JSON.',
+            'You are a visual strategist for TikTok/Reels shorts. You can see the images and read on-screen text. Focus on visuals, perceived pacing, and key scenes. Always return strict JSON.',
         },
-        { role: 'user', content: visualPrompt },
+        {
+          role: 'user',
+          // Multi-modal: text + image_url blocks
+          content: userContent,
+        },
       ],
     });
 
@@ -453,6 +501,8 @@ async function processVisualJob() {
     // Attach frame_timeline (now with quality_score) and cleaned visual_events
     visualAnalysis.frame_timeline = frameTimeline;
     visualAnalysis.visual_events = eventsWithTimes;
+
+    // (on_screen_text_spans and on_screen_text_raw are left as returned by the model)
 
     // --- Save back to Supabase ---------------------------------------------
 
