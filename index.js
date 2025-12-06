@@ -520,12 +520,25 @@ async function processVisualJob() {
 
     // Store initial visual_analysis on the simulation;
     // analyze_simulation will later enrich this with storytelling/editing insights.
-    await supabase
-      .from('simulations')
-      .update({ visual_analysis: visualAnalysis })
-      .eq('id', job.simulation_id);
+    // Pull out OCR text if present
+const ocrText =
+  typeof visualAnalysis?.on_screen_text_raw === 'string'
+    ? visualAnalysis.on_screen_text_raw
+    : '';
 
-    console.log('Job completed:', job.id);
+// Store initial visual_analysis on the simulation;
+// also mark that vision/OCR is ready.
+await supabase
+  .from('simulations')
+  .update({
+    visual_analysis: visualAnalysis,
+    on_screen_text_raw: ocrText || null,   // optional but handy
+    analysis_stage: 'vision_ready',        // 👈 key flag for ordering
+  })
+  .eq('id', job.simulation_id);
+
+console.log('Job completed:', job.id);
+
   } catch (err) {
     console.error('processVisualJob error:', err);
 
